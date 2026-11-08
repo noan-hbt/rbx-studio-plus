@@ -19,7 +19,7 @@ export function decidePull(local: string | undefined, base: string | undefined, 
   return "conflict";
 }
 
-export const normalize = (s: string) => s.replace(/\r\n/g, "\n");
+export const normalize = (s: string) => s.replace(/^﻿/, "").replace(/\r\n/g, "\n");
 const MANIFEST = ".rbxsync.json";
 const MAX_ITEMS = 250;            // per Luau call (serializer caps arrays at 300)
 const MAX_BYTES = 1_500_000;      // per Luau call

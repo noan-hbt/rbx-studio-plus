@@ -5,7 +5,7 @@ import { Studio, LuauError, DM } from "./studio.js";
 import { SyncEngine, PUSH_LUA_FOR_TOOLS } from "./sync/engine.js";
 import { ToolResult, textOf, UpstreamTool } from "./upstream.js";
 import { splitPath, cleanError } from "./luau.js";
-import { diffConsole, ConsoleEntry, formatConsole, ConsoleCursor } from "./console.js";
+import { diffConsole, ConsoleEntry, formatConsole, ConsoleCursor, pluginNoise } from "./console.js";
 
 type Args = Record<string, any>;
 export interface ToolDef { name: string; description: string; inputSchema: any; handler: (a: Args) => Promise<ToolResult | string> }
@@ -179,7 +179,7 @@ return __HS:JSONEncode(out)`, undefined, { ...o, timeoutMs: 30_000 }).then((s: a
       }),
       async handler(a) {
         let code: string = a.code ?? "";
-        if (a.file) code = await fsp.readFile(path.resolve(a.file), "utf8");
+        if (a.file) code = (await fsp.readFile(path.resolve(a.file), "utf8")).replace(/^﻿/, "").replace(/\r\n/g, "\n");
         if (!code.trim()) throw new Error("Provide 'code' or 'file'.");
         const r = await studio.luau(code, { studio: a.studio, context: a.context, timeoutMs: Math.min(600, a.timeout_s ?? 60) * 1000 });
         return formatLuau(r);
@@ -238,10 +238,13 @@ return __HS:JSONEncode(out)`, undefined, { ...o, timeoutMs: 30_000 }).then((s: a
         let entries: ConsoleEntry[] = [];
         try { entries = await readConsole({ studio: a.studio, context: want.toLowerCase() }); } catch (e: any) { parts.push(`(could not read console: ${e.message})`); }
         if (a.stop_after !== false) await play("stop", a.studio).catch((e) => parts.push(`(could not stop: ${e.message})`));
-        const errs = entries.filter((e) => e.t === "MessageError").length, warns = entries.filter((e) => e.t === "MessageWarning").length;
+        const foreign = pluginNoise(entries);
+        const errs = entries.filter((e) => e.t === "MessageError" && !foreign.has(e)).length;
+        const warns = entries.filter((e) => e.t === "MessageWarning" && !foreign.has(e)).length;
+        const ign = [...foreign].filter((e) => e.t === "MessageError" || e.t === "MessageWarning").length;
         if (errs) ok = false;
         return [
-          `${ok ? "✔ PASS" : "✘ FAIL"} · ran ${Math.round((Date.now() - t0) / 1000)}s · ${errs} error(s), ${warns} warning(s)${a.stop_after === false ? " · still playing" : ""}`,
+          `${ok ? "✔ PASS" : "✘ FAIL"} · ran ${Math.round((Date.now() - t0) / 1000)}s · ${errs} error(s), ${warns} warning(s)${ign ? ` (+${ign} from Studio plugins, ignored)` : ""}${a.stop_after === false ? " · still playing" : ""}`,
           ...parts,
           "--- console ---",
           formatConsole(entries, { tail: 300 }) || "(empty)",

@@ -185,6 +185,7 @@ export function cleanError(msg: string): string {
     .map((l) => l.replace(/^.*sabuiltin_\S*:\d+:\s*/, "").replace(/AssistantCommand:(\d+):?/g, "line $1:"))
     .filter((l) => !/sabuiltin_|^\s*$|^Stack Begin|^Stack End|^line \d+:\s*$|^line \d+: function __\w+$/.test(l))
     .join("\n")
+    .replace(/(lacking capability \w+\)?)/, "$1 — Studio's MCP sandbox can't access this member; wrap it in pcall or skip it")
     .trim();
 }
 
