@@ -54,19 +54,29 @@ Every other Studio tool (`generate_mesh`, `insert_asset`, `screen_capture`, inpu
 
 **1. Enable Studio's MCP server.** In Roblox Studio, go to *Assistant → … → Manage MCP Servers* and turn on **Enable Studio as MCP server**.
 
-**2. Install.**
+**2. One-line install** (clones/updates, builds, links `rbx-studio-plus`, and registers `"roblox-plus"` in Claude Code + Codex):
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/noan-hbt/rbx-studio-plus/main/install.ps1 | iex
+```
+
+**macOS / Linux:**
+```sh
+curl -fsSL https://raw.githubusercontent.com/noan-hbt/rbx-studio-plus/main/install.sh | bash
+```
+
+<details>
+<summary>Manual install or other MCP clients (Cursor, Claude Desktop, VS Code, project .mcp.json…)</summary>
 
 ```sh
 git clone https://github.com/noan-hbt/rbx-studio-plus.git
 cd rbx-studio-plus
 npm install && npm run build
-node dist/src/index.js install      # registers "roblox-plus" in Claude Code + Codex
+node dist/src/index.js install --claude --codex   # also supports --cursor, --project, --print
 ```
 
-**3. Restart your agent**, then ask it something like *"pull the scripts and playtest the game"*.
-
-<details>
-<summary>Other MCP clients (Cursor, Claude Desktop, VS Code…)</summary>
+Or paste into your client's MCP config:
 
 ```json
 {
@@ -79,8 +89,10 @@ node dist/src/index.js install      # registers "roblox-plus" in Claude Code + C
 }
 ```
 
-Use `install --claude` or `install --codex` to register in only one of them.
+Re-run the one-line installer anytime to update to the latest `main`. You can pass flags via `RBX_PLUS_INSTALL_ARGS="--cursor"` (or `curl ... | bash -s -- --cursor`).
 </details>
+
+**3. Restart your agent**, then ask it something like *"pull the scripts and playtest the game"*.
 
 ## 🧰 Tools
 
