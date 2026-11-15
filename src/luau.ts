@@ -8,8 +8,9 @@ const PRELUDE = `
 local __HS = game:GetService("HttpService")
 local __out, __cnt, __t0 = {}, 0, os.clock()
 local __rp, __rw = print, warn
-local __G = _G.__rbxplus or { pages = {}, up = {}, seq = 0 }
+local __G = _G.__rbxplus or { pages = {}, pageOrder = {}, up = {}, seq = 0 }
 _G.__rbxplus = __G
+__G.pageOrder = __G.pageOrder or {}
 local function __fmt(...) local t = table.pack(...) for i = 1, t.n do t[i] = tostring(t[i]) end return table.concat(t, " ") end
 local function print(...) __cnt += 1 if __cnt <= ${MAX_LINES} then table.insert(__out, __fmt(...)) end __rp(...) end
 local function warn(...) __cnt += 1 if __cnt <= ${MAX_LINES} then table.insert(__out, "[warn] " .. __fmt(...)) end __rw(...) end
@@ -19,6 +20,7 @@ local function __ser(v, d, seen)
  if tv == "boolean" or tv == "string" or tv == "nil" then return v end
  if tv == "Instance" then return "<" .. v.ClassName .. "> " .. v:GetFullName() end
  if tv == "EnumItem" then return tostring(v) end
+ if tv == "buffer" then return "buffer(" .. buffer.len(v) .. " bytes)" end
  if tv == "table" then
   if seen[v] then return "<cycle>" end
   if d > 6 then return "<table>" end
@@ -44,6 +46,8 @@ local function __emit(s)
  __G.seq += 1
  local id = tostring(__G.seq)
  __G.pages[id] = s
+ table.insert(__G.pageOrder, id)
+ while #__G.pageOrder > 12 do local old = table.remove(__G.pageOrder, 1) if old then __G.pages[old] = nil end end
  local e = __cut(s, 1)
  return "@@PAGE " .. id .. " " .. #s .. " " .. e .. "\\n" .. string.sub(s, 1, e)
 end
@@ -115,12 +119,125 @@ local function __scripts()
  return list
 end
 local __SES = game:GetService("ScriptEditorService")
+local __CS = game:GetService("CollectionService")
 local function __src(s) local ok, r = pcall(__SES.GetEditorSource, __SES, s) if ok and r then return r end return s.Source end
 local function __setsrc(s, src)
- local ok, e = pcall(function() __SES:UpdateSourceAsync(s, function() return src end) end)
+ local ok = pcall(function() __SES:UpdateSourceAsync(s, function() return src end) end)
  if not ok then s.Source = src end
 end
 local function __data(id) local d = __G.up[id] __G.up[id] = nil return __HS:JSONDecode(table.concat(d)) end
+`;
+
+/** Luau helper converting JSON-friendly values into Roblox datatypes and applying props/attributes/tags. */
+export const VALUE_LUA = `
+local function __color3(v)
+ if type(v) == "string" then
+  if string.sub(v, 1, 1) == "#" then return Color3.fromHex(v) end
+  return BrickColor.new(v).Color
+ end
+ if type(v) == "table" then
+  if v.hex then return Color3.fromHex(v.hex) end
+  if v.rgb then return Color3.fromRGB(v.rgb[1] or 0, v.rgb[2] or 0, v.rgb[3] or 0) end
+  if v.Color3 then return Color3.new(v.Color3[1] or 0, v.Color3[2] or 0, v.Color3[3] or 0) end
+  local r, g, b = v[1] or 0, v[2] or 0, v[3] or 0
+  if r > 1 or g > 1 or b > 1 then return Color3.fromRGB(r, g, b) end
+  return Color3.new(r, g, b)
+ end
+ error("invalid Color3", 0)
+end
+local function __val(v, cur)
+ local tc = typeof(cur)
+ local function n(t, i) return t[i] or 0 end
+ if type(v) == "string" then
+  if tc == "EnumItem" then local nm = string.match(v, "([^.]+)$") return cur.EnumType[nm] end
+  if tc == "BrickColor" then return BrickColor.new(v) end
+  if tc == "Color3" then return __color3(v) end
+  if tc == "Font" then local ok, f = pcall(Font.fromEnum, Enum.Font[v]) if ok then return f end return Font.new(v) end
+  return v
+ end
+ if type(v) ~= "table" then
+  if tc == "NumberRange" and type(v) == "number" then return NumberRange.new(v, v) end
+  if tc == "NumberSequence" and type(v) == "number" then return NumberSequence.new(v) end
+  return v
+ end
+ if #v > 0 then
+  if tc == "Vector3" then return Vector3.new(n(v,1), n(v,2), n(v,3)) end
+  if tc == "Vector2" then return Vector2.new(n(v,1), n(v,2)) end
+  if tc == "Color3" then return __color3(v) end
+  if tc == "CFrame" then v = { CFrame = v } end
+  if tc == "UDim2" then return UDim2.new(n(v,1), n(v,2), n(v,3), n(v,4)) end
+  if tc == "UDim" then return UDim.new(n(v,1), n(v,2)) end
+  if tc == "NumberRange" then return NumberRange.new(n(v,1), v[2] or n(v,1)) end
+  if tc == "Rect" then return Rect.new(n(v,1), n(v,2), n(v,3), n(v,4)) end
+  if tc == "PhysicalProperties" then return PhysicalProperties.new(n(v,1), n(v,2), n(v,3), v[4] or 1, v[5] or 1) end
+  if tc == "ColorSequence" then
+   if type(v[1]) == "string" or (type(v[1]) == "table" and not v[1].color) then
+    if #v == 1 then return ColorSequence.new(__color3(v[1])) end
+    local kps = {}
+    for i, c in v do table.insert(kps, ColorSequenceKeypoint.new((i - 1) / (#v - 1), __color3(c))) end
+    return ColorSequence.new(kps)
+   end
+   local kps = {}
+   for _, kp in v do table.insert(kps, ColorSequenceKeypoint.new(kp.t or kp.time or 0, __color3(kp.color or kp.c or kp.value))) end
+   return ColorSequence.new(kps)
+  end
+  if tc == "NumberSequence" then
+   if type(v[1]) == "number" then
+    if #v == 1 then return NumberSequence.new(v[1]) end
+    local kps = {}
+    for i, num in v do table.insert(kps, NumberSequenceKeypoint.new((i - 1) / (#v - 1), num)) end
+    return NumberSequence.new(kps)
+   end
+   local kps = {}
+   for _, kp in v do table.insert(kps, NumberSequenceKeypoint.new(kp.t or kp.time or 0, kp.v or kp.value or 0, kp.env or kp.envelope or 0)) end
+   return NumberSequence.new(kps)
+  end
+  if tc == "Faces" then local args = {} for _, f in v do table.insert(args, Enum.NormalId[f]) end return Faces.new(table.unpack(args)) end
+  if tc == "Axes" then local args = {} for _, a in v do table.insert(args, Enum.Axis[a]) end return Axes.new(table.unpack(args)) end
+ end
+ if v.Vector3 then local t = v.Vector3 return Vector3.new(n(t,1), n(t,2), n(t,3)) end
+ if v.Vector2 then local t = v.Vector2 return Vector2.new(n(t,1), n(t,2)) end
+ if v.Color3 or v.rgb or v.hex then return __color3(v) end
+ if v.CFrame then local t = v.CFrame
+  if #t == 6 then return CFrame.new(t[1], t[2], t[3]) * CFrame.Angles(math.rad(t[4]), math.rad(t[5]), math.rad(t[6])) end
+  return CFrame.new(table.unpack(t)) end
+ if v.UDim2 then local t = v.UDim2 return UDim2.new(n(t,1), n(t,2), n(t,3), n(t,4)) end
+ if v.UDim then local t = v.UDim return UDim.new(n(t,1), n(t,2)) end
+ if v.NumberRange then local t = v.NumberRange return NumberRange.new(n(t,1), t[2] or n(t,1)) end
+ if v.Rect then local t = v.Rect return Rect.new(n(t,1), n(t,2), n(t,3), n(t,4)) end
+ if v.ColorSequence then return __val(v.ColorSequence, ColorSequence.new(Color3.new())) end
+ if v.NumberSequence then return __val(v.NumberSequence, NumberSequence.new(0)) end
+ if v.Font then local t = v.Font
+  if type(t) == "string" then local ok, f = pcall(Font.fromEnum, Enum.Font[t]) return ok and f or Font.new(t) end
+  return Font.new(t.family or "rbxasset://fonts/families/SourceSansPro.json", t.weight and Enum.FontWeight[t.weight] or Enum.FontWeight.Regular, t.style and Enum.FontStyle[t.style] or Enum.FontStyle.Normal) end
+ if v.PhysicalProperties then local t = v.PhysicalProperties return PhysicalProperties.new(n(t,1), n(t,2), n(t,3), t[4] or 1, t[5] or 1) end
+ if v.Enum then local a, b = string.match(v.Enum, "^([^.]+)%.(.+)$") return Enum[a][b] end
+ if v.BrickColor then return BrickColor.new(v.BrickColor) end
+ if v.ref then return __need(v.ref) end
+ if v.nil_ then return nil end
+ error("unsupported value " .. __HS:JSONEncode(v), 0)
+end
+local function __apply(inst, props, attrs, tags)
+ local res = {}
+ for k, v in props or {} do
+  local ok, e = pcall(function() local cur = nil pcall(function() cur = inst[k] end) inst[k] = __val(v, cur) end)
+  res[k] = ok and "ok" or tostring(e)
+ end
+ for k, v in attrs or {} do
+  local ok, e = pcall(function() inst:SetAttribute(k, __val(v, inst:GetAttribute(k))) end)
+  res["@" .. k] = ok and "ok" or tostring(e)
+ end
+ if tags then
+  if #tags > 0 then
+   for _, t in tags do __CS:AddTag(inst, t) res["#" .. t] = "added" end
+  else
+   for _, t in tags.add or {} do __CS:AddTag(inst, t) res["#" .. t] = "added" end
+   for _, t in tags.remove or {} do __CS:RemoveTag(inst, t) res["#" .. t] = "removed" end
+  end
+ end
+ return res
+end
+local function __p(i) return table.concat(__segs(i), ".") end
 `;
 
 const oneLine = (s: string) => s.trim().split("\n").map((l) => l.trim()).filter(Boolean).join(" ");

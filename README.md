@@ -86,21 +86,22 @@ Use `install --claude` or `install --codex` to register in only one of them.
 
 | Tool | What it does |
 |---|---|
-| `studio_status` | **Start here.** Connected studios, play mode, datamodels, sync state |
+| `studio_status` | **Start here.** Connected studios, play mode, PlaceId, datamodels, script-sync state |
 | `studio_select` | Pick one Studio when several are open |
+| `game_overview` | One-call snapshot: services, script counts, Remotes/Bindables, CollectionService tags, Lighting & StarterPlayer |
 | `luau_run` | Run Luau (inline or a local `.luau` file), get output + result + errors |
-| `console` | New Output lines since the last call; `level`, `filter` (`/regex/`), `tail` |
+| `console` | New Output lines per datamodel; `level`, `filter` (`/regex/`), `tail`, plugin noise filtered by default |
 | `play` | `start` / `stop` / `status` (waits for the switch) |
-| `playtest` | Start the game, run optional code on server or client, collect errors, stop → **PASS / FAIL** |
-| `tree` | Compact hierarchy, or flat search with `class` / `name` filters |
-| `inspect` | Properties, attributes and children of an instance (optionally a subset) |
-| `set_props` | Set properties/attributes, e.g. `Size: [2,3,4]`, `Material: "Neon"`, `Color: "#ff0000"` |
-| `instance` | `create` / `delete` / `move` / `clone` / `rename` (all undoable) |
-| `script_read` · `script_write` · `script_edit` | Read with line numbers, full replace (creates parents), exact search/replace |
-| `script_check` | Compile every script, list syntax errors |
+| `playtest` | Start the game, optionally `wait_for_player`, run `server_code` & `client_code`, collect Server + Client errors, stop → **PASS / FAIL** |
+| `tree` | Compact hierarchy, or flat search with `class` / `name` / `tag` filters and `~N` paths |
+| `inspect` | Properties, attributes, CollectionService tags, and children of an instance (works in Edit & Playtest) |
+| `set_props` | Batch-set properties/attributes/tags by `path`, `paths`, or `tag`: `Size`, `Color`, `CFrame`, `UDim2`, `Rect`, `ColorSequence`, `NumberSequence`, `Font`, `PhysicalProperties` |
+| `instance` | `create` (with nested `children` & `tags`) / `delete` / `move` / `clone` / `rename` (all undoable) |
+| `script_read` · `script_write` · `script_edit` · `script_grep` | Read with line numbers, create/replace, atomic search/replace (`~N` safe), search across all scripts |
+| `script_check` | Compile every script + static `require()` cycle/path & `GetService()` checks (+ optional `luau-analyze`/`selene`) |
 | `selection` | Read or set what the user has selected in Studio |
 | `history` | Undo / redo |
-| `sync_pull` · `sync_push` · `sync_status` · `sync_watch` | Script ↔ file sync |
+| `sync_pull` · `sync_push` · `sync_status` · `sync_watch` · `sync_sourcemap` | Script ↔ file sync + Rojo `sourcemap.json` & `.luaurc` |
 
 Paths accept `Workspace.Model.Part`, `game.Workspace…` or `Workspace/Model/Part`. Duplicate sibling names are addressed as `Name~2`.
 
@@ -114,11 +115,12 @@ roblox-src/
 │       └── Helper.luau           ← ModuleScript
 ├── StarterPlayer/StarterPlayerScripts/
 │   └── Client.client.luau        ← LocalScript
+├── .rbxsyncignore                ← optional ignore globs (e.g. ReplicatedStorage/Packages)
 └── .rbxsync.json                 ← sync state (do not edit)
 ```
 
-- **`sync_pull`** exports every script, by default to `./roblox-src` (or `RBX_SYNC_DIR`). Re-running it only rewrites what changed.
-- Edit the files with any tool, then **`sync_push`**. New files become new scripts: the class comes from the suffix and missing Folders are created. Deleted files are removed in Studio only with `delete_missing: true`.
+- **`sync_pull`** exports every script (unlimited count), by default to `./roblox-src` (or `RBX_SYNC_DIR`). Pass `sourcemap: true` to also generate `sourcemap.json` for Luau LSP / `luau-analyze`.
+- Edit the files with any tool, then **`sync_push`**. New files become new scripts: the class comes from the suffix (with optional `--!runcontext client|server` header) and missing Folders are created. Deleted files are removed in Studio only with `delete_missing: true`.
 - **No silent overwrites.** If a script changed both locally and in Studio, the push is refused. A pull writes `<file>.studio` next to your file: merge it, delete it, then push with `force: true`.
 - **`sync_watch on=true`** turns on live sync: saved files are pushed instantly and Studio edits are pulled every 3 s.
 - Each folder is bound to one place. Pulling a different place into it requires `force`.
@@ -142,8 +144,7 @@ Trees
 
 ✘ FAIL · ran 8s · 1 error(s), 0 warning(s)
 --- console ---
-[GameManager] Started
-[E] OnClientEvent is not a valid member of RemoteEvent "ReplicatedStorage.Remotes.RoundUpdate"
+[Client] [E] OnClientEvent is not a valid member of RemoteEvent "ReplicatedStorage.Remotes.RoundUpdate"
 ```
 
 ## ⌨️ CLI
@@ -151,8 +152,12 @@ Trees
 The same engine also works without an agent:
 
 ```sh
+rbx-studio-plus install [--claude] [--codex] [--cursor] [--project] [--print]
+rbx-studio-plus doctor
+rbx-studio-plus init [--dir D] [--studio S]
+rbx-studio-plus sourcemap [--dir D] [--out sourcemap.json] [--luaurc]
 rbx-studio-plus status
-rbx-studio-plus sync pull|push|status|watch [--dir D] [--studio S] [--force] [--dry-run] [--delete-missing]
+rbx-studio-plus sync pull|push|status|watch [--dir D] [--studio S] [--force] [--dry-run] [--delete-missing] [--sourcemap]
 rbx-studio-plus run script.luau [--context server]
 ```
 

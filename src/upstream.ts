@@ -1,6 +1,7 @@
 // Connection to Roblox Studio's built-in MCP server (we are its MCP client).
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -10,17 +11,25 @@ export interface UpstreamTool { name: string; description?: string; inputSchema:
 
 export class UpstreamError extends Error {}
 
+export function upstreamBridgePath(): string | undefined {
+  if (process.env.RBX_UPSTREAM_CMD) return undefined;
+  if (process.platform === "win32") {
+    return path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "Roblox", "mcp.bat");
+  }
+  return "/Applications/RobloxStudio.app/Contents/MacOS/StudioMCP";
+}
+
 export function upstreamCommand(): { command: string; args: string[] } {
   const env = process.env.RBX_UPSTREAM_CMD;
   if (env) {
     const arr = JSON.parse(env) as string[];
     return { command: arr[0], args: arr.slice(1) };
   }
+  const bridge = upstreamBridgePath()!;
   if (process.platform === "win32") {
-    const bat = path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "Roblox", "mcp.bat");
-    return { command: "cmd.exe", args: ["/c", bat] };
+    return { command: "cmd.exe", args: ["/c", bridge] };
   }
-  return { command: "/Applications/RobloxStudio.app/Contents/MacOS/StudioMCP", args: [] };
+  return { command: bridge, args: [] };
 }
 
 export const DEFAULT_TIMEOUT_MS = Number(process.env.RBX_TIMEOUT_MS ?? 60_000);
@@ -37,9 +46,13 @@ export class Upstream {
     if (this.client) return this.client;
     if (this.connecting) return this.connecting;
     this.connecting = (async () => {
+      const bridge = upstreamBridgePath();
+      if (bridge && !fs.existsSync(bridge)) {
+        throw new UpstreamError(`Roblox Studio MCP bridge not found at '${bridge}'. Install/update Roblox Studio or set RBX_UPSTREAM_CMD.`);
+      }
       const { command, args } = upstreamCommand();
       const transport = new StdioClientTransport({ command, args, stderr: "pipe" });
-      const client = new Client({ name: "rbx-studio-plus", version: "0.1.0" });
+      const client = new Client({ name: "rbx-studio-plus", version: "0.2.0" });
       transport.onclose = () => { if (this.client === client) { this.client = undefined; this.tools = undefined; } };
       try {
         await withTimeout(client.connect(transport), 30_000, `Could not start Studio's MCP bridge (${command} ${args.join(" ")}). ${NOT_RUNNING_HINT}`);
@@ -69,16 +82,22 @@ export class Upstream {
         const r = await c.callTool({ name, arguments: args }, undefined, { timeout: timeoutMs, resetTimeoutOnProgress: true, maxTotalTimeout: timeoutMs });
         return r as unknown as ToolResult;
       } catch (e: any) {
+        if (e instanceof UpstreamError) throw e;
         const msg = String(e?.message ?? e);
         const isTimeout = /timed? ?out|-32001/i.test(msg);
         if (isTimeout) throw new UpstreamError(`Studio did not answer '${name}' within ${Math.round(timeoutMs / 1000)}s. If the code was heavy, split it and call task.wait() between chunks. ${NOT_RUNNING_HINT}`);
-        if (attempt === 0 && /closed|EPIPE|not connected|ECONNRESET/i.test(msg)) { this.client = undefined; this.tools = undefined; continue; }
+        if (attempt === 0 && /closed|EPIPE|not connected|ECONNRESET|ERR_IPC|-32000/i.test(msg)) {
+          await this.client?.close().catch(() => {});
+          this.client = undefined;
+          this.tools = undefined;
+          continue;
+        }
         throw new UpstreamError(`${msg}. ${NOT_RUNNING_HINT}`);
       }
     }
   }
 
-  async close() { await this.client?.close().catch(() => {}); }
+  async close() { await this.client?.close().catch(() => {}); this.client = undefined; this.tools = undefined; }
 }
 
 export function textOf(r: ToolResult): string {

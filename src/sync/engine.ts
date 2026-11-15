@@ -4,7 +4,8 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { Studio } from "../studio.js";
 import { fnv, splitPath } from "../luau.js";
-import { StudioScript, ScriptClass, mapScripts, fileToTarget, isScriptFile, underPrefix } from "./mapping.js";
+import { StudioScript, ScriptClass, mapScripts, fileToTarget, isScriptFile, underPrefix, isIgnored } from "./mapping.js";
+import { generateSourcemap } from "./sourcemap.js";
 
 export interface ManifestEntry { segs: string[]; cls: ScriptClass; rc?: string; hash: string }
 export interface Manifest { version: 1; place?: string; files: Record<string, ManifestEntry>; lastPull?: string; lastPush?: string }
@@ -19,11 +20,13 @@ export function decidePull(local: string | undefined, base: string | undefined, 
   return "conflict";
 }
 
-export const normalize = (s: string) => s.replace(/^﻿/, "").replace(/\r\n/g, "\n");
+export const normalize = (s: string) => s.replace(/^﻿/, "").replace(/\r\n?/g, "\n");
 const MANIFEST = ".rbxsync.json";
+const IGNORE_FILE = ".rbxsyncignore";
 const MAX_ITEMS = 250;            // per Luau call (serializer caps arrays at 300)
 const MAX_BYTES = 1_500_000;      // per Luau call
 
+// Encode as JSON in Luau so places with >300 scripts are never truncated by __ser's 300-item array cap.
 const LIST_LUA = `
 local out = {}
 for i, s in __scripts() do
@@ -31,7 +34,7 @@ for i, s in __scripts() do
  table.insert(out, { s = __segs(s), c = s.ClassName, rc = ok and rc or nil, h = __fnv(__src(s)) })
  if i % 40 == 0 then task.wait() end
 end
-return out`;
+return __HS:JSONEncode(out)`;
 
 const FETCH_LUA = `
 local out = {}
@@ -56,8 +59,12 @@ for i, it in DATA do
     end
     x = c
    end
-   inst = Instance.new(it.cls)
+   local cls = it.cls
+   local rc = it.rc
+   if rc and cls == "LocalScript" then cls = "Script" end
+   inst = Instance.new(cls)
    inst.Name = it.s[#it.s]
+   if rc and inst:IsA("Script") then pcall(function() inst.RunContext = Enum.RunContext[rc] end) end
    inst.Parent = x
    __setsrc(inst, it.src)
    res[i] = { st = "created", h = __fnv(__src(inst)) }
@@ -79,12 +86,21 @@ return res`;
 
 export const PUSH_LUA_FOR_TOOLS = PUSH_LUA;
 
+/** Detect optional `--!runcontext client|server|legacy` directive in top 5 lines. */
+export function parseRunContextHint(src: string): string | undefined {
+  const head = src.split("\n", 5).join("\n");
+  const m = head.match(/--\s*!runcontext\s+(client|server|legacy)\b/i);
+  if (!m) return undefined;
+  return m[1][0].toUpperCase() + m[1].slice(1).toLowerCase();
+}
+
 export interface SyncReport { lines: string[]; conflicts: string[]; changed: number }
 
 export class SyncEngine {
   log: string[] = [];
   watching?: { dir: string; stop: () => void; interval: number };
   private busy: Promise<unknown> = Promise.resolve();
+  private suppressedWatch = new Map<string, string>();
 
   constructor(private studio: Studio) {}
 
@@ -112,9 +128,17 @@ export class SyncEngine {
     await fsp.writeFile(path.join(dir, MANIFEST), JSON.stringify(m, null, 1));
   }
 
+  async loadIgnore(dir: string): Promise<string[]> {
+    try {
+      const txt = await fsp.readFile(path.join(dir, IGNORE_FILE), "utf8");
+      return txt.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+    } catch { return []; }
+  }
+
   async listStudio(studio?: string): Promise<StudioScript[]> {
-    const raw = await this.studio.rpc<any[]>(LIST_LUA, undefined, { studio, context: "edit", timeoutMs: 120_000 });
-    return (raw ?? []).map((x) => ({ segs: x.s, cls: x.c, rc: x.rc ?? undefined, hash: x.h }));
+    const json = await this.studio.rpc<string>(LIST_LUA, undefined, { studio, context: "edit", timeoutMs: 120_000 });
+    const raw = JSON.parse(json || "[]") as any[];
+    return raw.map((x) => ({ segs: x.s, cls: x.c, rc: x.rc ?? undefined, hash: x.h }));
   }
 
   private async fetch(scripts: StudioScript[], studio?: string): Promise<(string | false)[]> {
@@ -146,14 +170,16 @@ export class SyncEngine {
       throw new Error(`This folder is synced with '${m.place}' but the target studio is '${place}'. Use another dir, or force: true to rebind it.`);
   }
 
-  pull(o: { dir?: string; paths?: string[]; force?: boolean; studio?: string } = {}): Promise<SyncReport> {
+  pull(o: { dir?: string; paths?: string[]; force?: boolean; studio?: string; sourcemap?: boolean } = {}): Promise<SyncReport> {
     return this.exclusive(async () => {
       const dir = this.resolveDir(o.dir);
       const m = await this.loadManifest(dir);
       const place = await this.placeName(o.studio);
       this.checkPlace(m, place, o.force);
       const prefixes = o.paths?.map(splitPath);
-      const map = mapScripts(await this.listStudio(o.studio));
+      const ignore = await this.loadIgnore(dir);
+      const allScripts = await this.listStudio(o.studio);
+      const map = mapScripts(allScripts.filter((s) => !isIgnored(s.segs, ignore)));
       const rep: SyncReport = { lines: [], conflicts: [], changed: 0 };
       const toFetch: [string, StudioScript][] = [];
       const decisions = new Map<string, PullDecision>();
@@ -179,9 +205,11 @@ export class SyncEngine {
           rep.lines.push(`CONFLICT ${rel}: changed both locally and in Studio. Studio version saved as ${rel}.studio — merge into ${rel}, delete the .studio file, then sync_push with force: true.`);
           continue;
         }
+        const h = fnv(src);
+        this.suppressedWatch.set(rel, h);
         await fsp.writeFile(file, src);
         await fsp.rm(file + ".studio", { force: true });
-        m.files[rel] = { segs: s.segs, cls: s.cls, rc: s.rc, hash: fnv(src) };
+        m.files[rel] = { segs: s.segs, cls: s.cls, rc: s.rc, hash: h };
         rep.changed++;
       }
       // Scripts gone from Studio.
@@ -190,6 +218,7 @@ export class SyncEngine {
         const file = path.join(dir, rel);
         const lh = await this.localHash(file);
         if (lh === undefined || lh === m.files[rel].hash) {
+          this.suppressedWatch.set(rel, "__deleted__");
           await fsp.rm(file, { force: true });
           await removeEmptyDirs(path.dirname(file), dir);
           delete m.files[rel];
@@ -200,6 +229,10 @@ export class SyncEngine {
       m.lastPull = new Date().toISOString();
       await this.saveManifest(dir, m);
       await writeReadme(dir);
+      if (o.sourcemap) {
+        const sm = await generateSourcemap(this.studio, { dir, studio: o.studio, scripts: allScripts });
+        rep.lines.push(`Generated ${path.basename(sm.outFile)} (${sm.scriptsMapped} scripts mapped).`);
+      }
       if (rep.changed || rep.conflicts.length) this.note(`pull: ${rep.changed} file(s) updated${rep.conflicts.length ? `, ${rep.conflicts.length} conflict(s)` : ""}`);
       rep.lines.unshift(`Pulled ${map.size} script(s) from '${place}' into ${dir}: ${rep.changed} written, ${rep.conflicts.length} conflict(s).`);
       return rep;
@@ -236,7 +269,7 @@ export class SyncEngine {
     return { modified, added, deleted };
   }
 
-  push(o: { dir?: string; files?: string[]; force?: boolean; dry_run?: boolean; delete_missing?: boolean; studio?: string } = {}): Promise<SyncReport> {
+  push(o: { dir?: string; files?: string[]; force?: boolean; dry_run?: boolean; delete_missing?: boolean; studio?: string; sourcemap?: boolean } = {}): Promise<SyncReport> {
     return this.exclusive(async () => {
       const dir = this.resolveDir(o.dir);
       const m = await this.loadManifest(dir);
@@ -245,6 +278,22 @@ export class SyncEngine {
         throw new Error(`Nothing to push: ${dir} is empty. Run sync_pull first.`);
       this.checkPlace(m, place, o.force);
       let { modified, added, deleted } = await this.localChanges(dir, m);
+      // Detect container promotion/demotion (e.g. Foo.luau -> Foo/init.luau) so old manifest key isn't treated as deleted.
+      const promotedFrom = new Map<string, string>();
+      const deletedSet = new Set(deleted);
+      for (const rel of added) {
+        const t = fileToTarget(rel);
+        if (!t) continue;
+        const segKey = t.segs.join("\u0000");
+        for (const dRel of deletedSet) {
+          if (m.files[dRel]?.segs.join("\u0000") === segKey) {
+            promotedFrom.set(rel, dRel);
+            deletedSet.delete(dRel);
+            break;
+          }
+        }
+      }
+      deleted = deleted.filter((d) => deletedSet.has(d));
       if (o.files?.length) {
         const want = new Set(o.files.map((f) => path.relative(dir, path.resolve(dir, f)).split(path.sep).join("/")));
         modified = modified.filter((f) => want.has(f)); added = added.filter((f) => want.has(f)); deleted = deleted.filter((f) => want.has(f));
@@ -260,7 +309,8 @@ export class SyncEngine {
         const t = fileToTarget(rel);
         if (!t) { rep.lines.push(`skipped ${rel}: a new script file must be inside a service folder, e.g. ServerScriptService/MyScript.server.luau`); continue; }
         const src = normalize(await fsp.readFile(path.join(dir, rel), "utf8"));
-        items.push({ s: t.segs, cls: t.cls, src, create: true, h: fnv(src) }); rels.push(rel);
+        const rc = parseRunContextHint(src);
+        items.push({ s: t.segs, cls: t.cls, rc, src, create: true, h: fnv(src) }); rels.push(rel);
       }
       if (o.delete_missing) for (const rel of deleted) { items.push({ s: m.files[rel].segs, del: true }); rels.push(rel); }
       else if (deleted.length) rep.lines.push(`${deleted.length} file(s) deleted locally but kept in Studio (pass delete_missing: true to delete them in Studio): ${deleted.join(", ")}`);
@@ -277,8 +327,11 @@ export class SyncEngine {
         for (let k = i; k < j; k++) {
           const r = res?.[k - i] ?? { st: "missing" }, rel = rels[k], it = items[k];
           if (r.st === "ok" || r.st === "created") {
+            const oldKey = promotedFrom.get(rel);
+            if (oldKey) delete m.files[oldKey];
             const t = it.create ? fileToTarget(rel)! : undefined;
-            m.files[rel] = { ...(m.files[rel] ?? { segs: t!.segs, cls: t!.cls }), hash: r.h };
+            const prev = m.files[rel];
+            m.files[rel] = { ...(prev ?? { segs: t!.segs, cls: it.rc && t!.cls === "LocalScript" ? "Script" : t!.cls, ...(it.rc ? { rc: it.rc } : {}) }), hash: r.h };
             if (r.h !== it.h) rep.lines.push(`note: Studio altered ${rel} on write (hash differs); run sync_pull to refresh`);
             rep.changed++;
             rep.lines.push(`${r.st === "created" ? "created" : "updated"} ${rel}`);
@@ -293,6 +346,10 @@ export class SyncEngine {
       m.place = place;
       m.lastPush = new Date().toISOString();
       await this.saveManifest(dir, m);
+      if (o.sourcemap && rep.changed) {
+        const sm = await generateSourcemap(this.studio, { dir, studio: o.studio });
+        rep.lines.push(`Updated ${path.basename(sm.outFile)} (${sm.scriptsMapped} scripts mapped).`);
+      }
       if (rep.changed || rep.conflicts.length) this.note(`push: ${rep.changed} change(s)${rep.conflicts.length ? `, ${rep.conflicts.length} conflict(s)` : ""}`);
       rep.lines.unshift(items.length ? `Pushed ${rep.changed}/${items.length} change(s) to '${place}'.` : "Nothing to push: no local changes since last sync.");
       return rep;
@@ -304,7 +361,8 @@ export class SyncEngine {
     const m = await this.loadManifest(dir);
     if (!m.place) return `Not synced yet: ${dir}. Run sync_pull to export the place's scripts there.`;
     const { modified, added, deleted } = await this.localChanges(dir, m);
-    const map = mapScripts(await this.listStudio(o.studio));
+    const ignore = await this.loadIgnore(dir);
+    const map = mapScripts((await this.listStudio(o.studio)).filter((s) => !isIgnored(s.segs, ignore)));
     const studioMod: string[] = [], studioNew: string[] = [], studioGone: string[] = [];
     for (const [rel, s] of map) { const e = m.files[rel]; if (!e) studioNew.push(rel); else if (e.hash !== s.hash) studioMod.push(rel); }
     for (const rel of Object.keys(m.files)) if (!map.has(rel)) studioGone.push(rel);
@@ -337,8 +395,19 @@ export class SyncEngine {
     return out;
   }
 
+  async sourcemap(o: { dir?: string; out?: string; studio?: string; max_depth?: number; luaurc?: boolean } = {}) {
+    const dir = this.resolveDir(o.dir);
+    return generateSourcemap(this.studio, {
+      dir,
+      outFile: o.out,
+      studio: o.studio,
+      maxDepth: o.max_depth,
+      writeLuaurc: o.luaurc,
+    });
+  }
+
   /** Two-way live sync: local edits are pushed (debounced), Studio edits are pulled (polling). */
-  async watch(o: { dir?: string; on: boolean; interval_s?: number; studio?: string }): Promise<string> {
+  async watch(o: { dir?: string; on: boolean; interval_s?: number; studio?: string; sourcemap?: boolean }): Promise<string> {
     if (!o.on) {
       if (!this.watching) return "Watch was not running.";
       this.watching.stop(); const d = this.watching.dir; this.watching = undefined;
@@ -348,33 +417,47 @@ export class SyncEngine {
     const dir = this.resolveDir(o.dir);
     if (this.watching) { this.watching.stop(); this.watching = undefined; }
     const m = await this.loadManifest(dir);
-    const first = !m.place ? await this.pull({ dir, studio: o.studio }) : undefined;
+    const first = !m.place ? await this.pull({ dir, studio: o.studio, sourcemap: o.sourcemap }) : undefined;
     const interval = Math.max(1, o.interval_s ?? 3) * 1000;
     let pending = new Set<string>(), timer: NodeJS.Timeout | undefined, stopped = false;
     const fire = () => {
       const files = [...pending]; pending = new Set();
-      this.push({ dir, files, studio: o.studio }).then((r) => { if (r.changed || r.conflicts.length) this.note(r.lines.join(" | ")); }).catch((e) => this.note(`push failed: ${e.message}`));
+      if (!files.length) return;
+      this.push({ dir, files, studio: o.studio, sourcemap: o.sourcemap }).then((r) => { if (r.changed || r.conflicts.length) this.note(r.lines.join(" | ")); }).catch((e) => this.note(`push failed: ${e.message}`));
     };
     const w = fs.watch(dir, { recursive: true }, (_ev, name) => {
       if (!name) return;
       const rel = name.toString().split(path.sep).join("/");
       if (!isScriptFile(rel) || rel.split("/").some((p) => p.startsWith("."))) return;
+      const sup = this.suppressedWatch.get(rel);
+      if (sup !== undefined) {
+        this.suppressedWatch.delete(rel);
+        try {
+          const cur = fnv(normalize(fs.readFileSync(path.join(dir, rel), "utf8")));
+          if (cur === sup) return;
+        } catch {
+          if (sup === "__deleted__") return;
+        }
+      }
       pending.add(rel);
       clearTimeout(timer); timer = setTimeout(fire, 300);
     });
-    let polling = false;
+    let polling = false, lastErr = "";
     const poll = setInterval(async () => {
       if (polling || stopped) return;
       polling = true;
       try {
         const mm = await this.loadManifest(dir);
-        const map = mapScripts(await this.listStudio(o.studio));
+        const ignore = await this.loadIgnore(dir);
+        const map = mapScripts((await this.listStudio(o.studio)).filter((s) => !isIgnored(s.segs, ignore)));
         let changed = false;
         for (const [rel, s] of map) if (mm.files[rel]?.hash !== s.hash) { changed = true; break; }
         if (!changed) for (const rel of Object.keys(mm.files)) if (!map.has(rel)) { changed = true; break; }
-        if (changed) { const r = await this.pull({ dir, studio: o.studio }); if (r.conflicts.length) this.note(r.lines.join(" | ")); }
-      } catch (e: any) { this.note(`poll failed: ${e.message}`); }
-      finally { polling = false; }
+        if (lastErr) { lastErr = ""; this.note("watch reconnected to Studio"); }
+        if (changed) { const r = await this.pull({ dir, studio: o.studio, sourcemap: o.sourcemap }); if (r.conflicts.length) this.note(r.lines.join(" | ")); }
+      } catch (e: any) {
+        if (e.message !== lastErr) { lastErr = e.message; this.note(`poll paused: ${e.message}`); }
+      } finally { polling = false; }
     }, interval);
     this.watching = { dir, interval, stop: () => { stopped = true; w.close(); clearInterval(poll); clearTimeout(timer); } };
     this.note(`watch on (${dir}, every ${interval / 1000}s)`);

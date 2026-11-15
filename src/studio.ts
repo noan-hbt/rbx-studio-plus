@@ -108,14 +108,15 @@ export class Studio {
 
   /** Run code through the capture wrapper; returns the structured result (never throws on Luau runtime errors). */
   async luau(code: string, o: { studio?: string; context?: string; timeoutMs?: number; lib?: boolean } = {}): Promise<LuauResult & { dm: DM }> {
+    const cleanCode = code.replace(/\r\n?/g, "\n");
     const dm = await this.pickDM(o.studio, o.context);
     let text: string;
     try {
-      text = await this.exec(wrap(code, { lib: o.lib }), dm, o.studio, o.timeoutMs);
+      text = await this.exec(wrap(cleanCode, { lib: o.lib }), dm, o.studio, o.timeoutMs);
     } catch (e) {
       // Studio only says "Failed to parse command code": ask loadstring for the real syntax error.
       if (e instanceof LuauError && /Failed to parse/i.test(e.message)) {
-        const diag = await this.exec(`local f, e = loadstring(${longString(code.replace(/\r\n?/g, "\n"))}, "=code") return e or "syntax error"`, dm, o.studio).catch(() => "syntax error");
+        const diag = await this.exec(`local f, e = loadstring(${longString(cleanCode)}, "=code") return e or "syntax error"`, dm, o.studio).catch(() => "syntax error");
         return { ok: false, ms: 0, output: [], dropped: 0, error: `Syntax error: ${diag.replace(/^code:(\d+):/, "line $1:")}`, dm };
       }
       throw e;
@@ -126,12 +127,17 @@ export class Studio {
       const total = Number(totalS);
       const parts = [text.slice(pm[0].length)];
       let next = Number(endS) + 1;
-      while (next <= total) {
-        const t = await this.exec(pageCode(id, next), dm, o.studio, o.timeoutMs);
-        if (t === "@@GONE") throw new LuauError("Paged result expired before it was fully read.");
-        const nl = t.indexOf("\n");
-        parts.push(t.slice(nl + 1));
-        next = Number(t.slice(0, nl)) + 1;
+      try {
+        while (next <= total) {
+          const t = await this.exec(pageCode(id, next), dm, o.studio, o.timeoutMs);
+          if (t === "@@GONE") throw new LuauError("Paged result expired before it was fully read.");
+          const nl = t.indexOf("\n");
+          parts.push(t.slice(nl + 1));
+          next = Number(t.slice(0, nl)) + 1;
+        }
+      } catch (e) {
+        await this.exec(`local G = _G.__rbxplus if G and G.pages then G.pages[${JSON.stringify(id)}] = nil end return ""`, dm, o.studio).catch(() => {});
+        throw e;
       }
       text = parts.join("");
       if (Buffer.byteLength(text, "utf8") !== total) throw new LuauError(`Paged result corrupted (${Buffer.byteLength(text, "utf8")}/${total} bytes).`);
@@ -152,12 +158,17 @@ export class Studio {
         const dm = await this.pickDM(o.studio, o.context);
         const id = `u${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
         let i = 0, first = true;
-        while (i < json.length) {
-          let j = Math.min(json.length, i + CODE_INLINE_LIMIT);
-          const cc = json.charCodeAt(j - 1);
-          if (j < json.length && cc >= 0xd800 && cc <= 0xdbff) j--; // never split a surrogate pair
-          await this.exec(uploadCode(id, json.slice(i, j), first), dm, o.studio, o.timeoutMs);
-          first = false; i = j;
+        try {
+          while (i < json.length) {
+            let j = Math.min(json.length, i + CODE_INLINE_LIMIT);
+            const cc = json.charCodeAt(j - 1);
+            if (j < json.length && cc >= 0xd800 && cc <= 0xdbff) j--; // never split a surrogate pair
+            await this.exec(uploadCode(id, json.slice(i, j), first), dm, o.studio, o.timeoutMs);
+            first = false; i = j;
+          }
+        } catch (e) {
+          await this.exec(`local G = _G.__rbxplus if G and G.up then G.up[${JSON.stringify(id)}] = nil end return ""`, dm, o.studio).catch(() => {});
+          throw e;
         }
         header = `local DATA = __data(${JSON.stringify(id)})\n`;
       }

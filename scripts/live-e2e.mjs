@@ -24,19 +24,39 @@ const call = async (name, args = {}, expect) => {
 const T = "ServerStorage/__rbxplus_test";
 try {
   await call("studio_status", {}, /Mode: Edit/);
+  await call("game_overview", {}, /PlaceId:/);
   await call("luau_run", { code: "print('hello', 42)\nreturn workspace:GetChildren()[1], Vector3.new(1,2,3)" }, /hello 42/);
   await call("luau_run", { code: "local a = nil\nreturn a.b" }, /line 2/).catch(() => {});
   await call("luau_run", { code: "local = 3" }, /Syntax error/);
   await call("tree", { depth: 1 }, /Workspace \[Workspace\]/);
-  await call("tree", { class: "BaseScript", max: 5 }, /\[/);
+  await call("tree", { class: "LuaSourceContainer", max: 5 }, /\[/);
   await call("instance", { op: "create", class: "Folder", parent: "ServerStorage", name: "__rbxplus_test" }, /created/);
-  await call("instance", { op: "create", class: "Part", parent: T, name: "P", props: { Anchored: true, Size: { Vector3: [2, 3, 4] }, Color: { rgb: [255, 0, 0] }, Material: { Enum: "Material.Neon" } } }, /"ok"/);
+  await call("instance", { op: "create", class: "Part", parent: T, name: "P", tags: ["__test_tag"], props: { Anchored: true, Size: { Vector3: [2, 3, 4] }, Color: { rgb: [255, 0, 0] }, Material: { Enum: "Material.Neon" } } }, /"ok"/);
+  await call("instance", {
+    op: "create",
+    class: "ScreenGui",
+    parent: T,
+    name: "TestHud",
+    children: [
+      {
+        class: "Frame",
+        name: "Panel",
+        props: { Size: [0.5, 0, 0.2, 0] },
+        children: [
+          { class: "UICorner", props: { CornerRadius: [0, 8] } },
+          { class: "UIGradient", props: { Color: ["#ff0000", "#0000ff"] } },
+        ],
+      },
+    ],
+  }, /"childrenCreated": 3/);
   await call("set_props", { path: `${T}/P`, props: { Transparency: 0.5, CFrame: [0, 10, 0, 0, 45, 0] }, attributes: { Hp: 100 } }, /"@Hp": "ok"/);
+  await call("set_props", { tag: "__test_tag", props: { CastShadow: false }, tags: { remove: ["__test_tag"] } }, /"count": 1/);
   await call("inspect", { path: `${T}.P`, props: ["Size", "Transparency"] }, /Transparency/);
   await call("script_write", { path: `${T}/Mod`, source: "local M = {}\nfunction M.f() return 1 end\nreturn M\n" }, /Created/);
   await call("script_read", { path: `${T}.Mod` }, /M\.f/);
   await call("script_edit", { path: `${T}.Mod`, edits: [{ old: "return 1", new: "return 2" }] });
   await call("script_read", { path: `${T}.Mod`, start: 2, end: 2 }, /return 2/);
+  await call("script_grep", { query: "M.f", paths: [T] }, /Mod:2:/);
   await call("script_check", { paths: [T] }, /compile/);
   await call("selection", { set: [`${T}/P`] }, /Selected \(1\)/);
   await call("selection", { set: [] });
@@ -71,6 +91,7 @@ try {
   await new Promise((r) => setTimeout(r, 3500));
   console.log("watch pulled studio edit:", /return 7/.test(fs.readFileSync(modFile, "utf8")));
   await call("sync_watch", { on: false });
+  await call("sync_sourcemap", { dir, out: path.join(dir, "sourcemap.json"), luaurc: true }, /scripts mapped/);
   // Delete via sync
   fs.rmSync(path.join(dir, "ServerStorage/__rbxplus_test/New.server.luau"));
   await call("sync_push", { dir, delete_missing: true }, /deleted in Studio/);
@@ -78,7 +99,12 @@ try {
   await call("tree", { path: T }, /New/);
   await call("history", { action: "redo" });
   if (process.argv.includes("--playtest")) {
-    await call("playtest", { code: "print('in game', #game:GetService('Players'):GetPlayers()) return game:GetService('RunService'):IsServer()", duration_s: 6 }, /--- console ---/);
+    await call("playtest", {
+      wait_for_player: true,
+      server_code: "print('server ok', #game:GetService('Players'):GetPlayers()) return game:GetService('RunService'):IsServer()",
+      client_code: "print('client ok') return game:GetService('RunService'):IsClient()",
+      duration_s: 6,
+    }, /✔ PASS/);
     await call("play", { action: "status" }, /Edit/);
   }
   // passthrough

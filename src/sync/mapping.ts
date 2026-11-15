@@ -75,3 +75,20 @@ export function underPrefix(segs: string[], prefixes?: string[][]): boolean {
   if (!prefixes?.length) return true;
   return prefixes.some((p) => p.length <= segs.length && p.every((x, i) => x === segs[i] || x === segs[i].replace(/~\d+$/, "")));
 }
+
+/** Check whether a Studio path (or relative path) matches any .rbxsyncignore pattern. */
+export function isIgnored(segs: string[], patterns?: string[]): boolean {
+  if (!patterns?.length) return false;
+  const rel = segs.join("/");
+  return patterns.some((raw) => {
+    const p = raw.trim().replace(/^\/+|\/+$/g, "");
+    if (!p || p.startsWith("#")) return false;
+    const body = p
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*\*/g, "\u0000")
+      .replace(/\*/g, "[^/]*")
+      .replace(/\u0000/g, ".*");
+    const prefix = p.includes("/") ? "^" : "(^|.*/)";
+    return new RegExp(`${prefix}${body}(/.*)?$`, "i").test(rel);
+  });
+}
